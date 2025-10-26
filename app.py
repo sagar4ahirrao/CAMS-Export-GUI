@@ -14,11 +14,17 @@ import os
 import traceback
 import requests
 import json
-import sqlite3
 import hashlib
 from typing import List, Dict, Any, Optional
 import numpy as np
 from scipy.optimize import fsolve
+
+# SQLAlchemy imports for improved DB performance and connection pooling
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, DateTime, Text, ForeignKey, func, Index
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session, relationship
+
 warnings.filterwarnings('ignore')
 
 # Configure logging
@@ -32,380 +38,335 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+Base = declarative_base()
+
+# ORM models
+class Portfolio(Base):
+    __tablename__ = 'portfolios'
+    id = Column(Integer, primary_key=True)
+    filename = Column(String, unique=True, nullable=False, index=True)
+    file_hash = Column(String, nullable=False)
+    upload_date = Column(DateTime, default=func.current_timestamp())
+    last_updated = Column(DateTime, default=func.current_timestamp(), onupdate=func.current_timestamp())
+    status = Column(String, default='active', index=True)
+
+    holdings = relationship('Holding', back_populates='portfolio', cascade='all, delete-orphan')
+    transactions = relationship('Transaction', back_populates='portfolio', cascade='all, delete-orphan')
+    summary = relationship('PortfolioSummary', back_populates='portfolio', uselist=False, cascade='all, delete-orphan')
+
+class Holding(Base):
+    __tablename__ = 'holdings'
+    id = Column(Integer, primary_key=True)
+    portfolio_id = Column(Integer, ForeignKey('portfolios.id', ondelete='CASCADE'), index=True)
+    fund_name = Column(String, nullable=False, index=True)
+    isin = Column(String, index=True)
+    amfi = Column(String)
+    rta = Column(String)
+    rta_code = Column(String)
+    advisor = Column(String)
+    type = Column(String)
+    units = Column(Float)
+    market_value = Column(Float)
+    cost_value = Column(Float)
+    nav = Column(Float)
+    folio = Column(String, index=True)
+    amc = Column(String)
+    pan = Column(String, index=True)
+    kyc = Column(String)
+    pankyc = Column(String)
+    current_nav = Column(Float)
+    nav_change_percent = Column(Float)
+    current_value = Column(Float, index=True)
+    absolute_gain = Column(Float)
+    return_percentage = Column(Float)
+    todays_gain_value = Column(Float)
+    todays_gain_percent = Column(Float)
+    portfolio_weight = Column(Float)
+    avg_purchase_price = Column(Float)
+    fund_house = Column(String)
+
+    portfolio = relationship('Portfolio', back_populates='holdings')
+
+    __table_args__ = (
+        Index('ix_holdings_portfolio_fund', 'portfolio_id', 'fund_name'),
+    )
+
+class Transaction(Base):
+    __tablename__ = 'transactions'
+    id = Column(Integer, primary_key=True)
+    portfolio_id = Column(Integer, ForeignKey('portfolios.id', ondelete='CASCADE'), index=True)
+    date = Column(DateTime, index=True)
+    description = Column(Text)
+    amount = Column(Float, index=True)
+    units = Column(Float)
+    nav = Column(Float)
+    balance = Column(Float)
+    type = Column(String)
+    scheme = Column(String, index=True)
+    folio = Column(String, index=True)
+
+    portfolio = relationship('Portfolio', back_populates='transactions')
+
+    __table_args__ = (
+        Index('ix_transactions_portfolio_date', 'portfolio_id', 'date'),
+    )
+
+class PortfolioSummary(Base):
+    __tablename__ = 'portfolio_summary'
+    id = Column(Integer, primary_key=True)
+    portfolio_id = Column(Integer, ForeignKey('portfolios.id', ondelete='CASCADE'), unique=True, index=True)
+    total_market_value = Column(Float)
+    total_cost = Column(Float)
+    statement_period_from = Column(String)
+    statement_period_to = Column(String)
+    processing_time = Column(Float)
+
+    portfolio = relationship('Portfolio', back_populates='summary')
+
 class DatabaseManager:
-    """Manages SQLite database operations for portfolio data"""
-    
+    """Manages SQLite database operations using SQLAlchemy for better performance."""
     def __init__(self, db_path: str = "portfolio_data.db"):
         self.db_path = db_path
+        # Use sqlite with check_same_thread disabled for threaded environments (Streamlit)
+        self.engine = create_engine(
+            f"sqlite:///{self.db_path}",
+            connect_args={"check_same_thread": False},
+            pool_pre_ping=True
+        )
+        # Use scoped_session to ensure thread-safety in Streamlit
+        self.Session = scoped_session(sessionmaker(bind=self.engine))
+
+        # Initialize DB and tables
         self.init_database()
-    
+
+        # Simple in-memory cache for XIRR results to avoid repeated expensive solves
+        self.xirr_cache: Dict[str, Optional[float]] = {}
+
     def init_database(self):
-        """Initialize database tables"""
+        """Create tables if they do not exist."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # Create portfolios table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS portfolios (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        filename TEXT UNIQUE NOT NULL,
-                        file_hash TEXT NOT NULL,
-                        upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        status TEXT DEFAULT 'active'
-                    )
-                ''')
-                
-                # Create holdings table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS holdings (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        portfolio_id INTEGER,
-                        fund_name TEXT NOT NULL,
-                        isin TEXT,
-                        amfi TEXT,
-                        rta TEXT,
-                        rta_code TEXT,
-                        advisor TEXT,
-                        type TEXT,
-                        units REAL,
-                        market_value REAL,
-                        cost_value REAL,
-                        nav REAL,
-                        folio TEXT,
-                        amc TEXT,
-                        pan TEXT,
-                        kyc TEXT,
-                        pankyc TEXT,
-                        current_nav REAL,
-                        nav_change_percent REAL,
-                        current_value REAL,
-                        absolute_gain REAL,
-                        return_percentage REAL,
-                        todays_gain_value REAL,
-                        todays_gain_percent REAL,
-                        portfolio_weight REAL,
-                        avg_purchase_price REAL,
-                        fund_house TEXT,
-                        FOREIGN KEY (portfolio_id) REFERENCES portfolios (id)
-                    )
-                ''')
-                
-                # Create transactions table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS transactions (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        portfolio_id INTEGER,
-                        date TIMESTAMP,
-                        description TEXT,
-                        amount REAL,
-                        units REAL,
-                        nav REAL,
-                        balance REAL,
-                        type TEXT,
-                        scheme TEXT,
-                        folio TEXT,
-                        FOREIGN KEY (portfolio_id) REFERENCES portfolios (id)
-                    )
-                ''')
-                
-                # Create portfolio_summary table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS portfolio_summary (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        portfolio_id INTEGER,
-                        total_market_value REAL,
-                        total_cost REAL,
-                        statement_period_from TEXT,
-                        statement_period_to TEXT,
-                        processing_time REAL,
-                        FOREIGN KEY (portfolio_id) REFERENCES portfolios (id)
-                    )
-                ''')
-                
-                conn.commit()
-                logger.info("Database initialized successfully")
-                
+            Base.metadata.create_all(self.engine)
+            logger.info("Database initialized successfully (SQLAlchemy)")
         except Exception as e:
-            logger.error(f"Error initializing database: {str(e)}")
+            logger.error(f"Error initializing database via SQLAlchemy: {str(e)}")
             raise
-    
+
     def calculate_file_hash(self, file_content: bytes) -> str:
         """Calculate SHA256 hash of file content"""
         return hashlib.sha256(file_content).hexdigest()
-    
+
     def save_portfolio(self, filename: str, file_content: bytes, parser: 'CAMSParser') -> int:
-        """Save portfolio data to database"""
+        """Save portfolio data to DB using SQLAlchemy session. Returns portfolio id."""
+        session = self.Session()
         try:
             file_hash = self.calculate_file_hash(file_content)
-            
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # Check if portfolio already exists
-                cursor.execute('SELECT id FROM portfolios WHERE filename = ?', (filename,))
-                existing = cursor.fetchone()
-                
-                if existing:
-                    # Update existing portfolio
-                    portfolio_id = existing[0]
-                    cursor.execute('''
-                        UPDATE portfolios 
-                        SET file_hash = ?, last_updated = CURRENT_TIMESTAMP, status = 'active'
-                        WHERE id = ?
-                    ''', (file_hash, portfolio_id))
-                    
-                    # Delete existing holdings and transactions
-                    cursor.execute('DELETE FROM holdings WHERE portfolio_id = ?', (portfolio_id,))
-                    cursor.execute('DELETE FROM transactions WHERE portfolio_id = ?', (portfolio_id,))
-                    cursor.execute('DELETE FROM portfolio_summary WHERE portfolio_id = ?', (portfolio_id,))
-                    
-                    logger.info(f"Updated existing portfolio: {filename}")
-                else:
-                    # Insert new portfolio
-                    cursor.execute('''
-                        INSERT INTO portfolios (filename, file_hash)
-                        VALUES (?, ?)
-                    ''', (filename, file_hash))
-                    portfolio_id = cursor.lastrowid
-                    logger.info(f"Created new portfolio: {filename}")
-                
-                # Calculate performance metrics before saving
-                holdings_df = pd.DataFrame(parser.holdings)
-                if not holdings_df.empty:
-                    holdings_df = calculate_performance_metrics(holdings_df)
-                    # Update parser holdings with calculated values
-                    parser.holdings = holdings_df.to_dict('records')
-                
-                # Save holdings
-                for holding in parser.holdings:
-                    # Ensure current_value is calculated
-                    current_value = holding.get('current_value', 0)
-                    if current_value == 0 and holding.get('market_value', 0) > 0:
-                        current_value = holding.get('market_value', 0)
-                    
-                    cursor.execute('''
-                        INSERT INTO holdings (
-                            portfolio_id, fund_name, isin, amfi, rta, rta_code, advisor, type,
-                            units, market_value, cost_value, nav, folio, amc, pan, kyc, pankyc,
-                            current_nav, nav_change_percent, current_value, absolute_gain,
-                            return_percentage, todays_gain_value, todays_gain_percent,
-                            portfolio_weight, avg_purchase_price, fund_house
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        portfolio_id, holding.get('fund_name', ''), holding.get('isin', ''),
-                        holding.get('amfi', ''), holding.get('rta', ''), holding.get('rta_code', ''),
-                        holding.get('advisor', ''), holding.get('type', ''), holding.get('units', 0),
-                        holding.get('market_value', 0), holding.get('cost_value', 0),
-                        holding.get('nav', 0), holding.get('folio', ''), holding.get('amc', ''),
-                        holding.get('pan', ''), holding.get('kyc', ''), holding.get('pankyc', ''),
-                        holding.get('current_nav', 0), holding.get('nav_change_percent', 0),
-                        current_value, holding.get('absolute_gain', 0),
-                        holding.get('return_percentage', 0), holding.get('todays_gain_value', 0),
-                        holding.get('todays_gain_percent', 0), holding.get('portfolio_weight', 0),
-                        holding.get('avg_purchase_price', 0), holding.get('fund_house', '')
-                    ))
-                
-                # Save transactions
-                for transaction in parser.transactions:
-                    cursor.execute('''
-                        INSERT INTO transactions (
-                            portfolio_id, date, description, amount, units, nav, balance, type, scheme, folio
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        portfolio_id, transaction.get('date'), transaction.get('description', ''),
-                        transaction.get('amount', 0), transaction.get('units', 0),
-                        transaction.get('nav', 0), transaction.get('balance', 0),
-                        transaction.get('type', ''), transaction.get('scheme', ''),
-                        transaction.get('folio', '')
-                    ))
-                
-                # Save portfolio summary
-                cursor.execute('''
-                    INSERT INTO portfolio_summary (
-                        portfolio_id, total_market_value, total_cost, statement_period_from,
-                        statement_period_to, processing_time
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                ''', (
-                    portfolio_id,
-                    parser.portfolio_summary.get('total_market_value', 0),
-                    parser.portfolio_summary.get('total_cost', 0),
-                    parser.portfolio_summary.get('statement_period', {}).get('from', ''),
-                    parser.portfolio_summary.get('statement_period', {}).get('to', ''),
-                    parser.processing_time
-                ))
-                
-                conn.commit()
-                logger.info(f"Successfully saved portfolio {filename} with {len(parser.holdings)} holdings and {len(parser.transactions)} transactions")
-                return portfolio_id
-                
+
+            existing = session.query(Portfolio).filter(Portfolio.filename == filename).one_or_none()
+
+            if existing:
+                portfolio = existing
+                portfolio.file_hash = file_hash
+                portfolio.last_updated = func.current_timestamp()
+                portfolio.status = 'active'
+
+                # Remove old child rows quickly
+                session.query(Holding).filter(Holding.portfolio_id == portfolio.id).delete(synchronize_session=False)
+                session.query(Transaction).filter(Transaction.portfolio_id == portfolio.id).delete(synchronize_session=False)
+                session.query(PortfolioSummary).filter(PortfolioSummary.portfolio_id == portfolio.id).delete(synchronize_session=False)
+
+                logger.info(f"Updated existing portfolio: {filename}")
+            else:
+                portfolio = Portfolio(filename=filename, file_hash=file_hash)
+                session.add(portfolio)
+                session.flush()  # get portfolio.id
+                logger.info(f"Created new portfolio: {filename}")
+
+            # Calculate performance metrics before saving
+            holdings_df = pd.DataFrame(parser.holdings)
+            if not holdings_df.empty:
+                holdings_df = calculate_performance_metrics(holdings_df)
+                parser.holdings = holdings_df.to_dict('records')
+
+            # Bulk insert holdings
+            holdings_objs = []
+            for holding in parser.holdings:
+                current_value = holding.get('current_value', 0)
+                if current_value == 0 and holding.get('market_value', 0) > 0:
+                    current_value = holding.get('market_value', 0)
+
+                h = Holding(
+                    portfolio_id=portfolio.id,
+                    fund_name=holding.get('fund_name', ''),
+                    isin=holding.get('isin', ''),
+                    amfi=holding.get('amfi', ''),
+                    rta=holding.get('rta', ''),
+                    rta_code=holding.get('rta_code', ''),
+                    advisor=holding.get('advisor', ''),
+                    type=holding.get('type', ''),
+                    units=holding.get('units', 0),
+                    market_value=holding.get('market_value', 0),
+                    cost_value=holding.get('cost_value', 0),
+                    nav=holding.get('nav', 0),
+                    folio=holding.get('folio', ''),
+                    amc=holding.get('amc', ''),
+                    pan=holding.get('pan', ''),
+                    kyc=holding.get('kyc', ''),
+                    pankyc=holding.get('pankyc', ''),
+                    current_nav=holding.get('current_nav', 0),
+                    nav_change_percent=holding.get('nav_change_percent', 0),
+                    current_value=current_value,
+                    absolute_gain=holding.get('absolute_gain', 0),
+                    return_percentage=holding.get('return_percentage', 0),
+                    todays_gain_value=holding.get('todays_gain_value', 0),
+                    todays_gain_percent=holding.get('todays_gain_percent', 0),
+                    portfolio_weight=holding.get('portfolio_weight', 0),
+                    avg_purchase_price=holding.get('avg_purchase_price', 0),
+                    fund_house=holding.get('fund_house', '')
+                )
+                holdings_objs.append(h)
+
+            if holdings_objs:
+                session.bulk_save_objects(holdings_objs)
+
+            # Bulk insert transactions
+            tx_objs = []
+            for transaction in parser.transactions:
+                tx = Transaction(
+                    portfolio_id=portfolio.id,
+                    date=transaction.get('date'),
+                    description=transaction.get('description', ''),
+                    amount=transaction.get('amount', 0),
+                    units=transaction.get('units', 0),
+                    nav=transaction.get('nav', 0),
+                    balance=transaction.get('balance', 0),
+                    type=transaction.get('type', ''),
+                    scheme=transaction.get('scheme', ''),
+                    folio=transaction.get('folio', '')
+                )
+                tx_objs.append(tx)
+
+            if tx_objs:
+                session.bulk_save_objects(tx_objs)
+
+            # Save portfolio summary
+            summary = PortfolioSummary(
+                portfolio_id=portfolio.id,
+                total_market_value=parser.portfolio_summary.get('total_market_value', 0),
+                total_cost=parser.portfolio_summary.get('total_cost', 0),
+                statement_period_from=parser.portfolio_summary.get('statement_period', {}).get('from', ''),
+                statement_period_to=parser.portfolio_summary.get('statement_period', {}).get('to', ''),
+                processing_time=parser.processing_time
+            )
+            session.add(summary)
+
+            session.commit()
+            logger.info(f"Successfully saved portfolio {filename} with {len(parser.holdings)} holdings and {len(parser.transactions)} transactions")
+            return portfolio.id
         except Exception as e:
+            session.rollback()
             logger.error(f"Error saving portfolio {filename}: {str(e)}")
             raise
-    
+        finally:
+            session.close()
+
     def load_all_portfolios(self) -> List[Dict]:
-        """Load all active portfolios from database"""
+        """Load all active portfolios from DB efficiently using joins and ORM relationships."""
+        session = self.Session()
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # Get all active portfolios
-                cursor.execute('''
-                    SELECT id, filename, upload_date, last_updated, status
-                    FROM portfolios 
-                    WHERE status = 'active'
-                    ORDER BY last_updated DESC
-                ''')
-                portfolios = cursor.fetchall()
-                
-                result = []
-                for portfolio in portfolios:
-                    portfolio_id, filename, upload_date, last_updated, status = portfolio
-                    
-                    # Load holdings
-                    cursor.execute('''
-                        SELECT * FROM holdings WHERE portfolio_id = ?
-                    ''', (portfolio_id,))
-                    holdings_data = cursor.fetchall()
-                    holdings_columns = [description[0] for description in cursor.description]
-                    
-                    # Load transactions
-                    cursor.execute('''
-                        SELECT * FROM transactions WHERE portfolio_id = ?
-                    ''', (portfolio_id,))
-                    transactions_data = cursor.fetchall()
-                    transactions_columns = [description[0] for description in cursor.description]
-                    
-                    # Load portfolio summary
-                    cursor.execute('''
-                        SELECT * FROM portfolio_summary WHERE portfolio_id = ?
-                    ''', (portfolio_id,))
-                    summary_data = cursor.fetchone()
-                    summary_columns = [description[0] for description in cursor.description]
-                    
-                    # Convert to dictionaries
-                    holdings = []
-                    for holding in holdings_data:
-                        holding_dict = dict(zip(holdings_columns, holding))
-                        # Remove id and portfolio_id from holding dict
-                        holding_dict.pop('id', None)
-                        holding_dict.pop('portfolio_id', None)
-                        holdings.append(holding_dict)
-                    
-                    transactions = []
-                    for transaction in transactions_data:
-                        trans_dict = dict(zip(transactions_columns, transaction))
-                        # Remove id and portfolio_id from transaction dict
-                        trans_dict.pop('id', None)
-                        trans_dict.pop('portfolio_id', None)
-                        transactions.append(trans_dict)
-                    
-                    summary = {}
-                    if summary_data:
-                        summary = dict(zip(summary_columns, summary_data))
-                        summary.pop('id', None)
-                        summary.pop('portfolio_id', None)
-                    
-                    result.append({
-                        'id': portfolio_id,
-                        'filename': filename,
-                        'upload_date': upload_date,
-                        'last_updated': last_updated,
-                        'status': status,
-                        'holdings': holdings,
-                        'transactions': transactions,
-                        'portfolio_summary': summary
-                    })
-                
-                logger.info(f"Loaded {len(result)} portfolios from database")
-                return result
-                
+            portfolios = session.query(Portfolio).filter(Portfolio.status == 'active').order_by(Portfolio.last_updated.desc()).all()
+            result = []
+
+            for p in portfolios:
+                # Use ORM relationships to fetch related rows
+                holdings = []
+                for h in p.holdings:
+                    holding_dict = {c.name: getattr(h, c.name) for c in h.__table__.columns}
+                    # Remove internal ids
+                    holding_dict.pop('id', None)
+                    holding_dict.pop('portfolio_id', None)
+                    holdings.append(holding_dict)
+
+                transactions = []
+                for t in p.transactions:
+                    trans_dict = {c.name: getattr(t, c.name) for c in t.__table__.columns}
+                    trans_dict.pop('id', None)
+                    trans_dict.pop('portfolio_id', None)
+                    transactions.append(trans_dict)
+
+                summary_obj = p.summary
+                summary = {}
+                if summary_obj:
+                    summary = {c.name: getattr(summary_obj, c.name) for c in summary_obj.__table__.columns}
+                    summary.pop('id', None)
+                    summary.pop('portfolio_id', None)
+
+                result.append({
+                    'id': p.id,
+                    'filename': p.filename,
+                    'upload_date': str(p.upload_date) if p.upload_date is not None else None,
+                    'last_updated': str(p.last_updated) if p.last_updated is not None else None,
+                    'status': p.status,
+                    'holdings': holdings,
+                    'transactions': transactions,
+                    'portfolio_summary': summary
+                })
+
+            logger.info(f"Loaded {len(result)} portfolios from database")
+            return result
         except Exception as e:
             logger.error(f"Error loading portfolios: {str(e)}")
             return []
-    
+        finally:
+            session.close()
+
     def delete_portfolio(self, portfolio_id: int) -> bool:
-        """Delete a portfolio and all its data"""
+        """Soft-delete a portfolio by marking status as inactive."""
+        session = self.Session()
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # Soft delete - mark as inactive
-                cursor.execute('''
-                    UPDATE portfolios SET status = 'inactive' WHERE id = ?
-                ''', (portfolio_id,))
-                
-                conn.commit()
+            portfolio = session.query(Portfolio).filter(Portfolio.id == portfolio_id).one_or_none()
+            if portfolio:
+                portfolio.status = 'inactive'
+                session.commit()
                 logger.info(f"Deleted portfolio with ID: {portfolio_id}")
                 return True
-                
+            return False
         except Exception as e:
+            session.rollback()
             logger.error(f"Error deleting portfolio {portfolio_id}: {str(e)}")
             return False
-    
+        finally:
+            session.close()
+
     def get_portfolio_stats(self) -> Dict:
-        """Get database statistics"""
+        """Get database statistics using efficient aggregated queries."""
+        session = self.Session()
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # Count portfolios
-                cursor.execute('SELECT COUNT(*) FROM portfolios WHERE status = "active"')
-                portfolio_count = cursor.fetchone()[0]
-                
-                # Count holdings
-                cursor.execute('''
-                    SELECT COUNT(*) FROM holdings h
-                    JOIN portfolios p ON h.portfolio_id = p.id
-                    WHERE p.status = "active"
-                ''')
-                holdings_count = cursor.fetchone()[0]
-                
-                # Count transactions
-                cursor.execute('''
-                    SELECT COUNT(*) FROM transactions t
-                    JOIN portfolios p ON t.portfolio_id = p.id
-                    WHERE p.status = "active"
-                ''')
-                transactions_count = cursor.fetchone()[0]
-                
-                # Total portfolio value - try multiple fields
-                cursor.execute('''
-                    SELECT SUM(COALESCE(current_value, market_value, 0)) FROM holdings h
-                    JOIN portfolios p ON h.portfolio_id = p.id
-                    WHERE p.status = "active"
-                ''')
-                total_value = cursor.fetchone()[0] or 0
-                
-                # If still 0, try using market_value
-                if total_value == 0:
-                    cursor.execute('''
-                        SELECT SUM(market_value) FROM holdings h
-                        JOIN portfolios p ON h.portfolio_id = p.id
-                        WHERE p.status = "active"
-                    ''')
-                    total_value = cursor.fetchone()[0] or 0
-                
-                # If still 0, try using cost_value as fallback
-                if total_value == 0:
-                    cursor.execute('''
-                        SELECT SUM(cost_value) FROM holdings h
-                        JOIN portfolios p ON h.portfolio_id = p.id
-                        WHERE p.status = "active"
-                    ''')
-                    total_value = cursor.fetchone()[0] or 0
-                
-                return {
-                    'portfolio_count': portfolio_count,
-                    'holdings_count': holdings_count,
-                    'transactions_count': transactions_count,
-                    'total_value': total_value
-                }
-                
+            portfolio_count = session.query(func.count(Portfolio.id)).filter(Portfolio.status == 'active').scalar() or 0
+
+            holdings_count = session.query(func.count(Holding.id)).join(Portfolio, Holding.portfolio_id == Portfolio.id).filter(Portfolio.status == 'active').scalar() or 0
+
+            transactions_count = session.query(func.count(Transaction.id)).join(Portfolio, Transaction.portfolio_id == Portfolio.id).filter(Portfolio.status == 'active').scalar() or 0
+
+            # Use COALESCE to attempt multiple fallbacks
+            total_value = session.query(func.sum(func.coalesce(Holding.current_value, Holding.market_value, 0))).join(Portfolio, Holding.portfolio_id == Portfolio.id).filter(Portfolio.status == 'active').scalar() or 0
+
+            if not total_value:
+                total_value = session.query(func.sum(Holding.market_value)).join(Portfolio, Holding.portfolio_id == Portfolio.id).filter(Portfolio.status == 'active').scalar() or 0
+
+            if not total_value:
+                total_value = session.query(func.sum(Holding.cost_value)).join(Portfolio, Holding.portfolio_id == Portfolio.id).filter(Portfolio.status == 'active').scalar() or 0
+
+            return {
+                'portfolio_count': int(portfolio_count),
+                'holdings_count': int(holdings_count),
+                'transactions_count': int(transactions_count),
+                'total_value': float(total_value)
+            }
         except Exception as e:
             logger.error(f"Error getting portfolio stats: {str(e)}")
             return {'portfolio_count': 0, 'holdings_count': 0, 'transactions_count': 0, 'total_value': 0}
+
+    
 
 def calculate_xirr(cash_flows, dates, guess=0.1):
     """
@@ -447,69 +408,97 @@ def calculate_xirr(cash_flows, dates, guess=0.1):
         logger.error(f"Error calculating XIRR: {str(e)}")
         return None
 
+XIRR_CACHE: Dict[str, Optional[float]] = {}
+
+
+def _build_xirr_cache_key_from_transactions(transactions_df: pd.DataFrame, current_value: float, current_date: Optional[datetime]):
+    """Create a deterministic cache key for a transactions DataFrame and current value/date."""
+    try:
+        if transactions_df is None or transactions_df.empty:
+            return None
+        # Build a compact representation: list of [date ISO, amount]
+        tx_list = []
+        for _, row in transactions_df.sort_values('date').iterrows():
+            if pd.isna(row.get('amount')) or pd.isna(row.get('date')):
+                continue
+            d = row['date']
+            if not isinstance(d, datetime):
+                d = pd.to_datetime(d)
+            tx_list.append([d.strftime('%Y-%m-%d'), float(row['amount'])])
+        key_obj = {
+            'tx': tx_list,
+            'current_value': float(current_value or 0.0),
+            'current_date': (current_date.strftime('%Y-%m-%d') if current_date else None),
+            'nav_fetch_time': LAST_NAV_FETCH_TIME.strftime('%Y-%m-%d %H:%M:%S') if LAST_NAV_FETCH_TIME else None
+        }
+        import json
+        key_str = json.dumps(key_obj, separators=(',', ':'), sort_keys=True)
+        return hashlib.sha256(key_str.encode()).hexdigest()
+    except Exception:
+        return None
+
+
 def calculate_portfolio_xirr(transactions_df, current_value, current_date=None):
     """
-    Calculate XIRR for a portfolio based on transactions and current value
-    
-    Args:
-        transactions_df: DataFrame with transaction data
-        current_value: Current portfolio value
-        current_date: Current date (defaults to today)
-    
-    Returns:
-        XIRR as a percentage
+    Calculate XIRR for a portfolio based on transactions and current value with caching.
     """
     try:
         if current_date is None:
             current_date = datetime.now()
-        
-        if transactions_df.empty:
+
+        if transactions_df is None or transactions_df.empty:
             return None
-        
+
+        # Ensure dates are in datetime format
+        transactions_df = safe_date_conversion(transactions_df, 'date')
+
+        # Build cache key
+        cache_key = _build_xirr_cache_key_from_transactions(transactions_df, current_value, current_date)
+        if cache_key and cache_key in XIRR_CACHE:
+            return XIRR_CACHE[cache_key]
+
         # Prepare cash flows
         cash_flows = []
         dates = []
-        
-        # Add all transactions as cash flows
+
         for _, row in transactions_df.iterrows():
             if pd.notna(row.get('amount')) and pd.notna(row.get('date')):
-                # Convert date to datetime if needed
-                if not isinstance(row['date'], datetime):
-                    trans_date = pd.to_datetime(row['date'])
-                else:
-                    trans_date = row['date']
-                
-                # Determine if it's an investment (negative) or withdrawal (positive)
+                trans_date = row['date'] if isinstance(row['date'], datetime) else pd.to_datetime(row['date'])
                 amount = float(row['amount'])
-                if 'purchase' in str(row.get('description', '')).lower() or 'investment' in str(row.get('description', '')).lower():
-                    cash_flows.append(-abs(amount))  # Investment (negative)
-                elif 'redemption' in str(row.get('description', '')).lower() or 'withdrawal' in str(row.get('description', '')).lower():
-                    cash_flows.append(abs(amount))   # Withdrawal (positive)
+                desc = str(row.get('description', '')).lower()
+
+                if 'purchase' in desc or 'investment' in desc or row.get('amount', 0) > 0:
+                    # Treat positive amounts as investments (outflow)
+                    cash_flows.append(-abs(amount))
+                elif 'redemption' in desc or 'withdrawal' in desc:
+                    cash_flows.append(abs(amount))
                 else:
-                    # Default: treat positive amounts as investments, negative as withdrawals
+                    # Default heuristic
                     cash_flows.append(-amount)
-                
+
                 dates.append(trans_date)
-        
-        # Add current value as final cash flow (positive - what we would get if we sold today)
+
+        # Add current value as final cash flow
         if current_value > 0:
-            cash_flows.append(current_value)
+            cash_flows.append(float(current_value))
             dates.append(current_date)
-        
+
         if len(cash_flows) < 2:
+            if cache_key:
+                XIRR_CACHE[cache_key] = None
             return None
-        
-        # Calculate XIRR
+
         xirr_rate = calculate_xirr(cash_flows, dates)
-        
-        if xirr_rate is not None:
-            return xirr_rate * 100  # Convert to percentage
-        else:
-            return None
-            
+        xirr_percent = xirr_rate * 100 if xirr_rate is not None else None
+
+        if cache_key:
+            XIRR_CACHE[cache_key] = xirr_percent
+
+        return xirr_percent
     except Exception as e:
         logger.error(f"Error calculating portfolio XIRR: {str(e)}")
         return None
+
 
 def calculate_fund_xirr(fund_name: str, all_transactions_df: pd.DataFrame, holdings_df: pd.DataFrame) -> Optional[float]:
     """
@@ -1695,7 +1684,7 @@ def display_investor_details(holdings_df):
     styled_df = display_df.style.applymap(color_investor_gains)
     
     # Display the table
-    st.dataframe(styled_df, width='stretch', hide_index=True)
+    st.dataframe(styled_df, use_container_width=True, hide_index=True)
     
     # Investor-wise detailed breakdown
     st.subheader("📊 Detailed Investor Breakdown")
@@ -1790,7 +1779,7 @@ def display_investor_details(holdings_df):
                 
                 folio_display_df['Return (%)'] = folio_display_df['Return (%)'].apply(lambda x: f"{x:.2f}%")
                 
-                st.dataframe(folio_display_df, width='stretch', hide_index=True)
+                st.dataframe(folio_display_df, use_container_width=True, hide_index=True)
                 
                 # Fund-wise breakdown for this investor
                 st.subheader(f"📈 Fund-wise Performance for PAN: {pan}")
@@ -1819,7 +1808,7 @@ def display_investor_details(holdings_df):
                 fund_display_df['Return (%)'] = fund_display_df['Return (%)'].apply(lambda x: f"{x:.2f}%")
                 fund_display_df['Units'] = fund_display_df['Units'].apply(lambda x: f"{x:,.4f}")
                 
-                st.dataframe(fund_display_df, width='stretch', hide_index=True)
+                st.dataframe(fund_display_df, use_container_width=True, hide_index=True)
                 
                 # Export functionality for this investor
                 csv = investor_data.to_csv(index=False)
@@ -1914,7 +1903,7 @@ def display_investor_details(holdings_df):
         
         folio_display_df['Return (%)'] = folio_display_df['Return (%)'].apply(lambda x: f"{x:.2f}%")
         
-        st.dataframe(folio_display_df, width='stretch', hide_index=True)
+        st.dataframe(folio_display_df, use_container_width=True, hide_index=True)
     
     # Export all investor data
     st.subheader("📥 Export Investor Data")
@@ -2021,9 +2010,9 @@ def display_portfolio_holdings_table(holdings_df, transactions_df=None):
 
         try:
             styled_df = display_df.style.applymap(color_gains)
-            st.dataframe(styled_df, width='stretch', hide_index=True)
+            st.dataframe(styled_df, use_container_width=True, hide_index=True)
         except Exception:
-            st.dataframe(display_df, width='stretch', hide_index=True)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
 
         # Summary metrics
         total_invested = portfolio_table.get('cost_value', pd.Series([0])).sum()
@@ -2179,7 +2168,7 @@ def display_portfolio_overview(holdings_df, total_value, transactions_df=None, x
                 hole=0.4
             )
             fig.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
     
     with col2:
         if not holdings_df.empty:
@@ -2194,7 +2183,7 @@ def display_portfolio_overview(holdings_df, total_value, transactions_df=None, x
                 color_continuous_scale='RdYlGn'
             )
             fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
     
     # Portfolio metrics
     st.subheader("Portfolio Metrics")
@@ -2261,7 +2250,7 @@ def display_fund_allocation(holdings_df):
             values='current_value',
             title='Portfolio Treemap - Current Value'
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
     
     with col2:
         # Cost vs Current value comparison
@@ -2275,7 +2264,7 @@ def display_fund_allocation(holdings_df):
             title='Cost Value vs Current Value',
             labels={'cost_value': 'Cost Value (₹)', 'current_value': 'Current Value (₹)'}
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
 def display_transactions(transactions_df):
     """Display transaction history"""
@@ -2331,7 +2320,7 @@ def display_transactions(transactions_df):
     # Display transactions
     st.dataframe(
         filtered_df.sort_values('date', ascending=False),
-        width='stretch',
+        use_container_width=True,
         hide_index=True
     )
     
@@ -2372,7 +2361,7 @@ def display_performance_analysis(holdings_df, transactions_df):
             title='Distribution of Returns',
             labels={'return_percentage': 'Returns (%)'}
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
     
     with col2:
         # Risk-Return scatter plot
@@ -2391,7 +2380,7 @@ def display_performance_analysis(holdings_df, transactions_df):
                 title='Risk-Return Analysis',
                 labels={'x': 'Returns (%)', 'y': 'Volatility'}
             )
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
     
     # Performance metrics
     st.subheader("Performance Metrics")
@@ -2475,7 +2464,7 @@ def display_holdings_details(holdings_df, transactions_df):
         lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A"
     )
     
-    st.dataframe(display_df, width='stretch', hide_index=True)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
     
     # Export option
     csv = sorted_df.to_csv(index=False)
@@ -2530,15 +2519,16 @@ def display_additional_info(raw_data):
         
         if folio_summary:
             folio_df = pd.DataFrame(folio_summary)
-            st.dataframe(folio_df, width='stretch', hide_index=True)
+            st.dataframe(folio_df, use_container_width=True, hide_index=True)
 
 def display_extracted_data_preview(parsers: List[CAMSParser]):
     """Display preview of extracted data to help debug parsing issues"""
-    st.markdown("---")
-    st.subheader("📊 Extracted Data Preview")
+    if parsers is not None:
+        st.markdown("---")
+        st.subheader("📊 Extracted Data Preview")
     
     if not parsers:
-        st.info("No parsers available")
+        # st.info("No parsers available")
         return
     
     for parser in parsers:
@@ -2614,22 +2604,23 @@ def display_extracted_data_preview(parsers: List[CAMSParser]):
                 st.write("**Detailed Holdings:**")
                 holdings_df = pd.DataFrame(parser.holdings)
                 st.dataframe(holdings_df[['fund_name', 'market_value', 'cost_value', 'units']], 
-                           width='stretch', hide_index=True)
+                           use_container_width=True, hide_index=True)
             
             # Show detailed transactions if available
             if parser.transactions:
                 st.write("**Detailed Transactions:**")
                 transactions_df = pd.DataFrame(parser.transactions)
                 st.dataframe(transactions_df[['date', 'description', 'amount', 'units']], 
-                           width='stretch', hide_index=True)
+                           use_container_width=True, hide_index=True)
 
 def display_processing_summary(parsers: List[CAMSParser]):
     """Display processing summary for all parsers"""
-    st.markdown("---")
-    st.subheader("📊 Processing Summary")
+    if parsers is not None:
+        st.markdown("---")
+        st.subheader("📊 Processing Summary")
     
     if not parsers:
-        st.info("No files processed")
+        # st.info("No files processed")
         return
     
     # Create summary data
@@ -2686,7 +2677,7 @@ def display_processing_summary(parsers: List[CAMSParser]):
     display_df['Cost Value (₹)'] = display_df['Cost Value (₹)'].apply(lambda x: f"₹{x:,.2f}")
     display_df['Processing Time (s)'] = display_df['Processing Time (s)'].apply(lambda x: f"{x:.2f}s")
     
-    st.dataframe(display_df, width='stretch', hide_index=True)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
     
     # Show error details if any
     failed_parsers = [p for p in parsers if p.parse_status == 'Failed']

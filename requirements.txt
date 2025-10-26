@@ -4,3 +4,4 @@ plotly
 casparser
 scipy
 numpy
+sqlalchemy
